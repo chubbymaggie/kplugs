@@ -4,6 +4,7 @@
 
 #include <linux/sched.h>
 #include <linux/kernel.h>
+#include <linux/vmalloc.h>
 #include <linux/module.h>
 #include <linux/mm_types.h>
 #include <linux/uaccess.h>
@@ -15,13 +16,44 @@ MODULE_LICENSE("GPL");
 
 #include "env.h"
 #include "memory.h"
+#include "queue.h"
+
+static spinlock_t memory_lock;
+
+#ifdef HAS_LOOKUP_ADDRESS
+int memory_poke_kernel_address(const void *addr, word value)
+{
+    struct page *page;
+    void *page_addr;
+
+    if ((word)addr & (sizeof(word) - 1)) {
+		ERROR(-ERROR_POINT);
+    }
+
+    if (__module_address((unsigned long)addr) == NULL) {
+        page = virt_to_page(addr);
+    } else {
+        page = vmalloc_to_page(addr);
+    }
+    if (!page) {
+		ERROR(-ERROR_POINT);
+    }
+
+    page_addr = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
+    if (!page_addr) {
+		ERROR(-ERROR_MEM);
+    }
+    *(word *)(page_addr + ((word)addr & (PAGE_SIZE - 1))) = value;
+    vunmap(page_addr);
+    return 0;
+}
+EXPORT_SYMBOL(memory_poke_kernel_address);
+#endif
 
 /* check the permissions of a address and return its type - */
-static int memory_check_addr_perm_task(void *addr, word *size, int write, byte *read_only, byte *executable, struct task_struct *task)
+static int memory_check_addr_perm_task(const void *addr, word *size, int write, byte *read_only, byte *executable, struct task_struct *task)
 {
-	pte_t *pte;
 	struct vm_area_struct *vma;
-	unsigned int level;
 	word start = ROUNDDOWN((word)addr, PAGE_SIZE);
 	word end = ROUNDUP((word)addr + *size, PAGE_SIZE);
 	word total_size = 0;
@@ -29,6 +61,10 @@ static int memory_check_addr_perm_task(void *addr, word *size, int write, byte *
 	byte local_executable = 0;
 	int ret = ADDR_UNDEF;
 	int atomic;
+#ifdef HAS_LOOKUP_ADDRESS
+	pte_t *pte;
+	unsigned int level;
+#endif
 
 	if (NULL == read_only) {
 		read_only = &local_read_only;
@@ -49,7 +85,7 @@ static int memory_check_addr_perm_task(void *addr, word *size, int write, byte *
 
 	while (start < end) {
 		if (task && task->mm) {
-			/* check if it's a user pointer */
+			/* check if it's a user address */
 			vma = find_vma(task->mm, start);
 			if (vma && vma->vm_start <= start) {
 				if (ret != ADDR_UNDEF && ret != ADDR_OUTSIDE) {
@@ -80,7 +116,9 @@ static int memory_check_addr_perm_task(void *addr, word *size, int write, byte *
 			}
 		}
 
-		/* check if it's a kernel pointer */
+		/* check if it's a kernel virtual address */
+
+#ifdef HAS_LOOKUP_ADDRESS
 		pte = lookup_address((unsigned long)addr, &level);
 		if (NULL == pte) {
 			goto end;
@@ -114,6 +152,23 @@ static int memory_check_addr_perm_task(void *addr, word *size, int write, byte *
 			continue;
 		}
 		goto end;
+#else
+		if (ret != ADDR_UNDEF && ret != ADDR_INSIDE) {
+			goto end;
+		}
+
+		if (	start >= PAGE_OFFSET ||
+			(start >= MODULES_VADDR && start < MODULES_END) ||
+			(start >= VMALLOC_START && start < VMALLOC_END)) {
+			/* this is not totally safe. but it's enough for now. */
+			*executable = 1;
+			start += PAGE_SIZE;
+			total_size = start - (word)addr;
+			ret = ADDR_INSIDE;
+			continue;
+		}
+		goto end;
+#endif
 	}
 
 end:
@@ -132,7 +187,7 @@ end:
 
 
 /* map an outside memory to an inside memory by task */
-static int memory_map_task(byte *addr, word *size, void **map, byte **new_addr, int write, struct task_struct *task)
+static int memory_map_task(const byte *addr, word *size, void **map, byte **new_addr, int write, struct task_struct *task)
 {
 	word start;
 	word offset;
@@ -162,7 +217,7 @@ static int memory_map_task(byte *addr, word *size, void **map, byte **new_addr, 
 		ERROR(-ERROR_MEM);
 	}
 
-	ret = get_user_pages(task, task->mm, start, npages, write, 0, pages, NULL);
+	ret = get_user_pages_remote(task, task->mm, start, npages, write ? FOLL_WRITE : 0, pages, NULL, NULL);
 	if (ret <= 0) {
 		memory_free(pages);
 		ERROR(-ERROR_POINT);
@@ -178,7 +233,11 @@ static int memory_map_task(byte *addr, word *size, void **map, byte **new_addr, 
 
 	BUG_ON((int)*size < 0);
 
+#ifndef PAGE_KERNEL_RO
+	*map = vmap(pages, npages, 0, PAGE_KERNEL);
+#else
 	*map = vmap(pages, npages, 0, write ? PAGE_KERNEL : PAGE_KERNEL_RO);
+#endif
 	memory_free(pages);
 	if (NULL == *map) {
 		ERROR(-ERROR_POINT);
@@ -189,7 +248,7 @@ static int memory_map_task(byte *addr, word *size, void **map, byte **new_addr, 
 }
 
 /* copy memory from safely from any type of memory to any type of memory (optional - from different processes) */
-int safe_memory_copy(void *dst, void *src, word len, int dst_hint, int src_hint, word dst_pid, word src_pid)
+int safe_memory_copy(void *dst, const void *src, word len, int dst_hint, int src_hint, word dst_pid, word src_pid)
 {
 	word new_len = len;
 	int dst_type, src_type;
@@ -296,14 +355,14 @@ clean:
 EXPORT_SYMBOL(safe_memory_copy);
 
 /* check memory permissions */
-int memory_check_addr_perm(byte *addr, word *size, int write, byte *read_only)
+int memory_check_addr_perm(const byte *addr, word *size, int write, byte *read_only)
 {
 	return memory_check_addr_perm_task(addr, size, write, read_only, NULL, current);
 }
 
 
 /* check if a memory is executable */
-int memory_check_addr_exec(byte *addr)
+int memory_check_addr_exec(const byte *addr)
 {
 	byte exec = 0;
 	word size = 1;
@@ -315,7 +374,7 @@ int memory_check_addr_exec(byte *addr)
 }
 
 /* map an outside memory to an inside memory */
-int memory_map(byte *addr, word *len, void **map, byte **new_addr, int write)
+int memory_map(const byte *addr, word *len, void **map, byte **new_addr, int write)
 {
 	return memory_map_task(addr, len, map, new_addr, write, current);
 }
@@ -341,7 +400,7 @@ int safe_memory_copy(void *dst, void *src, word len, int dst_hint, int src_hint,
 }
 
 /* check memory permissions */
-int memory_check_addr_perm(byte *addr, word *size, int write, byte *read_only)
+int memory_check_addr_perm(const byte *addr, word *size, int write, byte *read_only)
 {
 	if (NULL != read_only) {
 		*read_only = 0;
@@ -350,14 +409,14 @@ int memory_check_addr_perm(byte *addr, word *size, int write, byte *read_only)
 }
 
 /* check if a memory is executable */
-int memory_check_addr_exec(byte *addr)
+int memory_check_addr_exec(const byte *addr)
 {
 	/* we don't really check anything if there is no outside memory */
 	return 1;
 }
 
 /* map an outside memory to an inside memory */
-int memory_map(byte *addr, word *size, void **map, byte **new_addr, int write)
+int memory_map(const byte *addr, word *size, void **map, byte **new_addr, int write)
 {
 	/* all the memories are inside memory so this should never be called */
 	*new_addr = addr;
@@ -376,6 +435,7 @@ void memory_unmap(byte *addr)
 #endif
 
 dyn_mem_t dyn_global_head;
+dyn_mem_t dyn_inter_head;
 
 /* initialize a dynamic memory head */
 void memory_dyn_init(dyn_mem_t *head)
@@ -385,19 +445,34 @@ void memory_dyn_init(dyn_mem_t *head)
 
 void memory_dyn_clean(dyn_mem_t *head)
 {
-	dyn_mem_t *dyn = head->next;
+	dyn_mem_t *dyn = NULL;
 	dyn_mem_t *next;
+	unsigned long flags;
+	int lock = 0;
+
+	if (head == &dyn_global_head || head == &dyn_inter_head) {
+		lock = 1;
+		spin_lock_irqsave(&memory_lock, flags);
+	}
+
+	dyn = head->next;
 	while (NULL != dyn) {
 		next = dyn->next;
 		memory_free(dyn);
 		dyn = next;
+	}
+
+	if (lock) {
+		spin_unlock_irqrestore(&memory_lock, flags);
 	}
 }
 
 /* allocate a dynamic memory */
 void *memory_alloc_dyn(dyn_mem_t *head, word size)
 {
+	unsigned long flags;
 	dyn_mem_t *dyn;
+	int lock = 0;
 
 	if (size + sizeof(dyn_mem_t) < sizeof(dyn_mem_t)) {
 		return NULL;
@@ -412,31 +487,47 @@ void *memory_alloc_dyn(dyn_mem_t *head, word size)
 		head = &dyn_global_head;
 	}
 
+	if (head == &dyn_global_head || head == &dyn_inter_head) {
+		lock = 1;
+		spin_lock_irqsave(&memory_lock, flags);
+	}
+
 	dyn->size = size;
 	dyn->next = head->next;
+	dyn->head = head;
 	head->next = dyn;
 
+	if (lock) {
+		spin_unlock_irqrestore(&memory_lock, flags);
+	}
 	return (void *)&dyn->data;
 }
 
 /* free a dynamic memory */
 int memory_free_dyn(dyn_mem_t *head, void *ptr)
 {
+	unsigned long flags;
 	dyn_mem_t *dyn;
 	dyn_mem_t *prev;
+	int lock = 0;
+	int ret = -ERROR_NODYM;
 
 	if (head == NULL) {
 		head = &dyn_global_head;
 	}
 
 again:
+	if (!lock && (head == &dyn_global_head || head == &dyn_inter_head)) {
+		lock = 1;
+		spin_lock_irqsave(&memory_lock, flags);
+	}
 	prev = head;
 	dyn = prev->next;
 	while (NULL != dyn) {
 		if (&dyn->data == ptr) {
 			prev->next = dyn->next;
-			memory_free(dyn);
-			return 0;
+			ret = 0;
+			goto unlock;
 		}
 		prev = dyn;
 		dyn = dyn->next;
@@ -446,23 +537,33 @@ again:
 		head = &dyn_global_head;
 		goto again;
 	}
-	return -ERROR_NODYM;
+unlock:
+	if (lock) {
+		spin_unlock_irqrestore(&memory_lock, flags);
+	}
+	return ret;
 }
 
 /* checks if a pointer is a dynamic memory */
 dyn_mem_t *get_dyn_mem(dyn_mem_t *head, void *ptr)
 {
-	dyn_mem_t *dyn;
+	unsigned long flags;
+	dyn_mem_t *dyn = NULL;
+	int lock = 0;
 
 	if (head == NULL) {
 		head = &dyn_global_head;
 	}
 
 again:
+	if (!lock && (head == &dyn_global_head || head == &dyn_inter_head)) {
+		lock = 1;
+		spin_lock_irqsave(&memory_lock, flags);
+	}
 	dyn = head->next;
 	while (NULL != dyn) {
 		if (&dyn->data == ptr) {
-			return dyn;
+			goto unlock;
 		}
 		dyn = dyn->next;
 	}
@@ -471,9 +572,97 @@ again:
 		head = &dyn_global_head;
 		goto again;
 	}
-	return NULL;
+unlock:
+	if (lock) {
+		spin_unlock_irqrestore(&memory_lock, flags);
+	}
+	return dyn;
 }
 
+int transfer_dyn_mem(dyn_mem_t *head, dyn_mem_t *dyn)
+{
+	dyn_mem_t *old_head = dyn->head;
+	unsigned long flags;
+	int lock = 0;
+	int ret = 0;
+
+	if (head == old_head) {
+		return 0;
+	}
+
+	if (NULL == head) {
+		head = &dyn_global_head;
+	}
+
+	if (head == &dyn_global_head || head == &dyn_inter_head ||
+		old_head == &dyn_global_head || old_head == &dyn_inter_head) {
+		lock = 1;
+		spin_lock_irqsave(&memory_lock, flags);
+	}
+
+	while (old_head->next != dyn) {
+		if (NULL == old_head->next) {
+			/* this is weird! */
+			ret = -ERROR_NODYM;
+			goto unlock;
+		}
+		old_head = old_head->next;
+	}
+
+	old_head->next = dyn->next;
+	dyn->next = head->next;
+	dyn->head = head;
+	head->next = dyn;
+unlock:
+	if (lock) {
+		spin_unlock_irqrestore(&memory_lock, flags);
+	}
+	return ret;
+}
+
+void dyn_free_callback(void *data)
+{
+	dyn_mem_t *dyn = (dyn_mem_t *)data;
+
+	memory_free_dyn(dyn->head, &dyn->data);
+}
+
+/* get a buffer from user */
+int recv_data_from_other(struct queue_head *queue, dyn_mem_t *head, dyn_mem_t **dyn)
+{
+	int err;
+
+	if (NULL == head) {
+		head = &dyn_global_head;
+	}
+
+	if ((err = queue_dequeue(queue, (void **)dyn))) {
+		return err;
+	}
+
+	if ((err = transfer_dyn_mem(head, *dyn))) {
+		return err;
+	}
+
+	return 0;
+}
+
+/* send a buffer to user */
+int send_data_to_other(struct queue_head *queue, dyn_mem_t *dyn)
+{
+	int err = 0;
+
+	if ((err = transfer_dyn_mem(&dyn_inter_head, dyn))) {
+		memory_free_dyn(dyn->head, &dyn->data);
+		return err;
+	}
+
+	if ((err = queue_enqueue(queue, (void *)dyn))) {
+		memory_free_dyn(dyn->head, &dyn->data);
+		return err;
+	}
+	return err;
+}
 
 /* This is the code of a simple heap. */
 /* we need it because in the kernel you cannot use the allocator (cache) to allocate executable memory, and we want to allocate executable buffers */
@@ -483,13 +672,16 @@ heap_t *heaps;
 /* allocate executable and writable memory */
 void *memory_alloc_exec(word size)
 {
-	heap_t *found_heap = heaps;
+	heap_t *found_heap = NULL;
 	heap_t *new_heap = NULL;
+	unsigned long flags;
 	void *ret = NULL;
 
+	spin_lock_irqsave(&memory_lock, flags);
+	found_heap = heaps;
 	size = ROUNDUP(size, sizeof(word));
 	if (size < sizeof(word)) {
-		return NULL;
+		goto unlock;
 	}
 
 	if (size >= ((PAGE_SIZE - sizeof(heap_t)) / 2)) {
@@ -501,9 +693,9 @@ void *memory_alloc_exec(word size)
 		ret = mmap(NULL, ROUNDUP(size, PAGE_SIZE), PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 		if ((sword)ret == -1) {
 #endif
-			return NULL;
+			ret = NULL;
 		}
-		return ret;
+		goto unlock;
 	}
 
 	/* find the heap with elements big enough for us */
@@ -523,7 +715,7 @@ void *memory_alloc_exec(word size)
 		new_heap = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 		if ((sword)new_heap == -1) {
 #endif
-			return NULL;
+			goto unlock;
 		}
 
 		memory_set(new_heap, 0, PAGE_SIZE);
@@ -542,7 +734,8 @@ void *memory_alloc_exec(word size)
 			found_heap->next = new_heap;
 		}
 		/* return the first element */
-		return (void *)((byte *)new_heap + sizeof(heap_t));
+		ret = (void *)((byte *)new_heap + sizeof(heap_t));
+		goto unlock;
 	} else {
 		/* we found a heap */
 		found_heap->allocated++;
@@ -555,18 +748,24 @@ void *memory_alloc_exec(word size)
 				found_heap->first_elem = *(byte **)(found_heap->first_elem);
 			}
 		}
-		return ret;
+		goto unlock;
 	}
 	/* we should never get here */
-	return NULL;
+	ret = NULL;
+unlock:
+	spin_unlock_irqrestore(&memory_lock, flags);
+	return ret;
 }
 
 /* free an executable buffer */
 void memory_free_exec(void *mem)
 {
-	heap_t *found_heap = (heap_t *)(ROUNDDOWN((word)(mem), PAGE_SIZE));
+	heap_t *found_heap = NULL;
 	heap_t *del_heap = NULL;
+	unsigned long flags;
 
+	spin_lock_irqsave(&memory_lock, flags);
+	found_heap = (heap_t *)(ROUNDDOWN((word)(mem), PAGE_SIZE));
 	if (((word)mem & (PAGE_SIZE - 1)) == 0) {
 		/* if the buffer is page aligned, it is a large buffer */
 #ifdef __KERNEL__
@@ -574,7 +773,7 @@ void memory_free_exec(void *mem)
 #else
 		munmap(mem, PAGE_SIZE);
 #endif
-		return;
+		goto unlock;
 	}
 
 	found_heap->allocated--;
@@ -599,6 +798,8 @@ void memory_free_exec(void *mem)
 		*(byte **)mem = found_heap->first_elem;
 		found_heap->first_elem = mem;
 	}
+unlock:
+	spin_unlock_irqrestore(&memory_lock, flags);
 }
 
 
@@ -606,7 +807,9 @@ void memory_free_exec(void *mem)
 void memory_start(void)
 {
 	heaps = NULL;
+	spin_lock_init(&memory_lock);
 	memory_dyn_init(&dyn_global_head);
+	memory_dyn_init(&dyn_inter_head);
 }
 
 /* stop memory, and delete any buffer that wasn't deleted */
@@ -620,4 +823,5 @@ void memory_stop(void)
 	}
 
 	memory_dyn_clean(&dyn_global_head);
+	memory_dyn_clean(&dyn_inter_head);
 }

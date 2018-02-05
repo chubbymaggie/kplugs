@@ -162,7 +162,7 @@ static void load_state(function_t *func, vm_state_t *state, word pc, word num_ar
 }
 
 /* push a state in the state stack */
-static vm_state_t *push_state(function_t *func, stack_t *stack, word pc, word num_args)
+static vm_state_t *push_state(function_t *func, kpstack_t *stack, word pc, word num_args)
 {
 	vm_state_t state;
 
@@ -171,7 +171,7 @@ static vm_state_t *push_state(function_t *func, stack_t *stack, word pc, word nu
 }
 
 /* initialize the arguments and local variables buffer */
-static int vm_init_local_variable(vm_state_t *state, stack_t *arg_stack, word *vars, arg_cache_t *cache)
+static int vm_init_local_variable(vm_state_t *state, kpstack_t *arg_stack, word *vars, arg_cache_t *cache)
 {
 	word iter = state->func->num_maxargs;
 	word iter2 = 0;
@@ -250,7 +250,7 @@ static int vm_init_local_variable(vm_state_t *state, stack_t *arg_stack, word *v
 extern context_t *GLOBAL_CONTEXT;
 
 /* execute a function on the vm */
-word vm_run_function(function_t *func, stack_t *arg_stack, exception_t *excep)
+word vm_run_function(function_t *func, kpstack_t *arg_stack, exception_t *excep)
 {
 	word pc;
 	sword stage;
@@ -260,7 +260,7 @@ word vm_run_function(function_t *func, stack_t *arg_stack, exception_t *excep)
 
 	vm_state_t *state;
 	vm_state_t *new_state;
-	stack_t stack;
+	kpstack_t stack;
 
 	function_t *calling_function = NULL;
 	void *external_function = NULL;
@@ -479,6 +479,64 @@ word vm_run_function(function_t *func, stack_t *arg_stack, exception_t *excep)
 
 			break;
 
+			case FLOW_SEND_DATA:
+				if (val2) {
+					calling_function = context_find_function(state->func->cont, state->func->raw + state->func->string_table[val2 - 1]);
+					if (NULL == calling_function) {
+						if (NULL != GLOBAL_CONTEXT && state->func->cont != GLOBAL_CONTEXT) {
+							calling_function = context_find_function(GLOBAL_CONTEXT, state->func->raw + state->func->string_table[val2 - 1]);
+						}
+						if (NULL == calling_function) {
+							VM_THROW_EXCEPTION(ERROR_UFUNC);
+						}
+					}
+				}
+
+				dyn = NULL;
+				if (	state->func->code[val1].var.type == VAR_WORD ||
+						state->func->code[val1].var.type == VAR_POINTER) {
+					dyn = get_dyn_mem(&dyn_head, (void *)vars[val1 - 1]);
+					if (NULL == dyn) {
+						err = -ERROR_NODYM;
+						goto send_data_except;
+					}
+				} else {
+					temp_value = state->func->code[val1].var.size;
+					ret = (word)memory_alloc_dyn(&dyn_head, temp_value);
+					if ((word)NULL == ret) {
+						err = -ERROR_MEM;
+						goto send_data_except;
+					}
+					dyn = get_dyn_mem(&dyn_head, (void *)ret);
+					if (NULL == dyn) {
+						err = -ERROR_NODYM;
+						goto send_data_except;
+					}
+					err = cache_memory_copy((byte *)vars[val1 - 1], (byte *)ret, 0, temp_value, temp_value, &cache[val1 - 1], 0);
+					if (err < 0) {
+						goto send_data_except;
+					}
+				}
+				if ((err = send_data_to_other(val2 ? &calling_function->to_kernel :  &func->to_user, dyn))) {
+					/* send_data_to_other delete the dyn */
+					dyn = NULL;
+send_data_except:
+					if (NULL != dyn) {
+						memory_free_dyn(&dyn_head, (void *)ret);
+					}
+					if (val2) {
+						function_put(calling_function);
+					}
+					VM_THROW_EXCEPTION(-err);
+				}
+
+				if (val2) {
+					function_put(calling_function);
+				}
+				VM_STEP();
+
+			break;
+
 			case FLOW_BLOCKEND:
 				VM_LEAVE_BLOCK();
 
@@ -662,12 +720,17 @@ word vm_run_function(function_t *func, stack_t *arg_stack, exception_t *excep)
 					ret = state->val - ret;
 					VM_LEAVE_BLOCK();
 				}
-			case EXP_MUL:
+			case EXP_MUL_UNSIGN:
 				if (stage == 2) {
 					ret = state->val * ret;
 					VM_LEAVE_BLOCK();
 				}
-			case EXP_DIV:
+			case EXP_MUL_SIGN:
+				if (stage == 2) {
+					ret = (word)((sword)state->val * (sword)ret);
+					VM_LEAVE_BLOCK();
+				}
+			case EXP_DIV_UNSIGN:
 				if (stage == 2) {
 					if (ret == 0) {
 						VM_THROW_EXCEPTION(ERROR_DIV);
@@ -676,19 +739,28 @@ word vm_run_function(function_t *func, stack_t *arg_stack, exception_t *excep)
 
 					VM_LEAVE_BLOCK();
 				}
+			case EXP_DIV_SIGN:
+				if (stage == 2) {
+					if (ret == 0) {
+						VM_THROW_EXCEPTION(ERROR_DIV);
+					}
+					ret = (word)((sword)state->val / (sword)ret);
+
+					VM_LEAVE_BLOCK();
+				}
 			case EXP_AND:
 				if (stage == 2) {
 					ret = state->val & ret;
 					VM_LEAVE_BLOCK();
 				}
-			case EXP_OR:
-				if (stage == 2) {
-					ret = state->val | ret;
-					VM_LEAVE_BLOCK();
-				}
 			case EXP_XOR:
 				if (stage == 2) {
 					ret = state->val ^ ret;
+					VM_LEAVE_BLOCK();
+				}
+			case EXP_OR:
+				if (stage == 2) {
+					ret = state->val | ret;
 					VM_LEAVE_BLOCK();
 				}
 			case EXP_BOOL_AND:
@@ -733,6 +805,13 @@ word vm_run_function(function_t *func, stack_t *arg_stack, exception_t *excep)
 				if (stage == 1) {
 					ret = !ret;
 					VM_LEAVE_BLOCK();
+				}
+			case EXP_EXT_SIGN:
+				if (stage == 1) {
+					if (ret > 0xff) {
+						VM_THROW_EXCEPTION(ERROR_PARAM);
+					}
+					ret = (word)((sword)(char)ret);
 				}
 				if (stage == 0) {
 					VM_ENTER_BLOCK(val1);
@@ -897,6 +976,18 @@ word vm_run_function(function_t *func, stack_t *arg_stack, exception_t *excep)
 
 					VM_LEAVE_BLOCK();
 				}
+			break;
+
+			case EXP_RECV_DATA:
+				ret = recv_data_from_other(&func->to_kernel, val2 ? NULL : &dyn_head, &dyn);
+				if (ret) {
+					VM_THROW_EXCEPTION(-ret);
+				} else {
+					ret = dyn->size;
+					vars[val1 - 1] = (word)&dyn->data;
+					VM_LEAVE_BLOCK();
+				}
+			break;
 
 			case EXP_ARGS:
 				ret = state->args;

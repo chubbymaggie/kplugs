@@ -3,7 +3,7 @@
 #ifndef CONFIG
 #define CONFIG
 
-#define VERSION_MAJOR		(1)
+#define VERSION_MAJOR		(3)
 #define VERSION_MINOR		(0)
 
 #define MAX_RECUR			(20)
@@ -15,6 +15,10 @@
 #define MAX_STACK_FRAME (0x200)
 
 #define STACK_MAX_PARAMETERS (15)
+
+#define MAX_QUEUE_SIZE (0x200)
+
+#define MAX_BUSY_WAIT  (50)
 
 #ifdef DEBUG
 
@@ -30,6 +34,10 @@
 
 /* will use the function kallsyms_lookup_name instead of find_symbol - works a lot better */ 
 #define USE_KALLSYMS
+
+#if defined(CONFIG_X86_64) || defined(CONFIG_X86_32)
+#define HAS_LOOKUP_ADDRESS
+#endif
 
 #endif
 

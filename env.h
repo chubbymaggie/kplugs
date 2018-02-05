@@ -24,13 +24,13 @@ void *memory_alloc(word size);
 void memory_free(void *mem);
 
 /* copy data from inside memory to inside memory */
-void *memory_copy(void *dst, void *src, word len);
+void *memory_copy(void *dst, const void *src, word len);
 
 /* copy data from outside memory to inside memory */
-int memory_copy_from_outside(void *dst, void *src, word len);
+int memory_copy_from_outside(void *dst, const void *src, word len);
 
 /* copy data from inside memory to outside memory */
-int memory_copy_to_outside(void *dst, void *src, word len);
+int memory_copy_to_outside(void *dst, const void *src, word len);
 
 /* set the value of an inside memory */
 void *memory_set(void *str, int ch, word num);
@@ -53,8 +53,14 @@ void *find_external_function(const byte *name);
 
 #include <linux/kernel.h>
 #include <linux/spinlock.h>
+#include <linux/sched.h>
+#include <linux/wait.h>
 
 #define output_string(...) printk(__VA_ARGS__)
+
+#define KPLUGS_IOCTYPE (154)
+
+#define define_io(num, cont) _IOWR(KPLUGS_IOCTYPE, num, cont)
 
 #else
 
@@ -69,12 +75,19 @@ typedef word spinlock_t;
 typedef word atomic_t;
 
 #define spin_lock_init(lock)
-#define spin_lock(lock)
-#define spin_unlock(lock)
+#define spin_lock_irqsave(lock, flags) ((flags) = 0)
+#define spin_unlock_irqrestore(lock, flags)
 
 #define atomic_set(atom, val) 		do { (*(atom))=val; } while (0)
 #define atomic_inc(atom)			do { ++(*(atom)); } while (0)
 inline int atomic_dec_and_test(atomic_t *atom);
+
+typedef word wait_queue_head_t;
+#define init_waitqueue_head(wq)
+#define wait_event_interruptible(wq, cond) 0
+#define wake_up_interruptible(wq)
+
+#define define_io(num, cont) num
 
 #endif
 

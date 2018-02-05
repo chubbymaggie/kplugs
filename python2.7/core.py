@@ -2,15 +2,16 @@
 
 import ast
 from _ast import *
+import world
 import struct
 import ctypes
 import os
 
 WORD_SIZE = struct.calcsize("P")
-VERSION   = (1, 0)
+VERSION   = (3, 0)
 
 # the kplugs main class
-class Plug(object):
+class PlugCore(object):
 
 	# kplugs commands:
 	KPLUGS_REPLY = 0
@@ -19,7 +20,10 @@ class Plug(object):
 	KPLUGS_EXECUTE_ANONYMOUS = 3
 	KPLUGS_UNLOAD = 4
 	KPLUGS_UNLOAD_ANONYMOUS = 5
-	KPLUGS_GET_LAST_EXCEPTION = 6
+	KPLUGS_SEND_DATA = 6
+	KPLUGS_SEND_DATA_ANONYMOUS = 7
+	KPLUGS_RECV_DATA = 8
+	KPLUGS_RECV_DATA_ANONYMOUS = 9
 
 	ERROR_TABLE = [
 	"",
@@ -42,58 +46,69 @@ class Plug(object):
 	"Wrong architecture",
 	"Unsupported version",
 	"Not a dynamic memory",
+	"Operation was interrupted",
 	]
 
-	
-	def __init__(self, glob = False):
-		self.fd = os.open('/dev/kplugs', os.O_RDWR)
+
+	def __init__(self, glob = False, ip = None):
+		self.world = world.PlugWorld(ip)
+		self.word_size = self.world.word_size
 		self.funcs = []
 		self.glob = glob
 		self.last_exception = []
 
 	def _exec_cmd(self, op, len1, len2, val1, val2):
-		# supports only little endian version.
-		header = WORD_SIZE + (1 << 7) + (VERSION[0] << 8) + (VERSION[1] << 16) + (op << 24)
-		try:
-			os.write(self.fd, struct.pack("PPPPP", header, len1, len2, val1, val2))
-		except:
-			exc = struct.unpack("P", os.read(self.fd, WORD_SIZE * 5)[WORD_SIZE * 3:WORD_SIZE * 4])[0]
+		ws = self.word_size
+		word_size  = ws
+		word_size |= (1 << 6) # supports only little endian version.
+		if self.glob:
+			word_size |= (1 << 7)
 
-			if op == Plug.KPLUGS_EXECUTE or op == Plug.KPLUGS_EXECUTE_ANONYMOUS:
-				try:
-					# try to get the exception parameters
-					excep = ctypes.c_buffer('\0' * (WORD_SIZE * 4))
-					header = WORD_SIZE + (1 << 7) + (VERSION[0] << 8) + (VERSION[1] << 16) + (Plug.KPLUGS_GET_LAST_EXCEPTION << 24)
-					os.write(self.fd, struct.pack("PPPPP", Plug.KPLUGS_GET_LAST_EXCEPTION, WORD_SIZE * 4, 0, ctypes.addressof(excep), 0))
-					excep = struct.unpack("PPPP", excep.raw[:WORD_SIZE * 4])
-					if exc == excep[1]:
-						self.last_exception = excep[2:]
-				except:
-					# probably we didn't fail because an exception
-					pass
-
-			if exc >= len(Plug.ERROR_TABLE):
+		header = chr(word_size) + chr(VERSION[0]) + chr(VERSION[1]) + chr(0)
+		header = (header + "\0"*ws)[:ws]
+		data   = header + self.world.pack(self.world.form*4, len1, len2, val1, val2)
+		excep  = struct.pack(self.world.form*4, 0, 0, 0, 0)
+		ret    = self.world.ioctl(op, data + excep, True)
+		data   = ret[:len(data)]
+		excep  = ret[len(data):]
+		error  = ord(data[3]) or ord(excep[0])
+		if error:
+			if ord(excep[0]):
+				_, exc, func, pc = struct.unpack(self.world.form*4, excep)
+				self.last_exception = [func, pc]
+			else:
+				exc = ord(data[3])
+			if exc >= len(PlugCore.ERROR_TABLE):
 				raise Exception("Error: 0x%x" % exc)
-			raise Exception(Plug.ERROR_TABLE[exc])
-		ret = os.read(self.fd, WORD_SIZE * 5)
-		if len(ret) == 0:
-			return
-		return struct.unpack("P", ret[WORD_SIZE * 3:WORD_SIZE * 4])[0]
+			raise Exception(PlugCore.ERROR_TABLE[exc])
+
+		_, _, val1, _ = struct.unpack(self.world.form*4, data[ws:])
+		return val1
 
 	def load(self, func, unhandled_return = None, function_type = 0):
-		if self.glob:
-			op = Plug.KPLUGS_LOAD | (1 << 7) # add the global flag
-		else:
-			op = Plug.KPLUGS_LOAD
+		op = PlugCore.KPLUGS_LOAD
+		if not type(func) is list:
+			func = [func]
 
-		compiled = func.to_bytes(unhandled_return, function_type)
-		buf = ctypes.c_buffer(compiled)
+		offsets = []
+		data = ""
+		for f in func:
+			offsets.append(len(data))
+			data += f.to_bytes(unhandled_return, function_type, self.world)
 
-		# send the command (will throw an exception if it fails)
-		func.addr = self._exec_cmd(op, len(compiled), 0, ctypes.addressof(buf), 0)
+		buf = self.world.alloc(len(data))
+		try:
+			self.world.mem_write(buf, data)
 
-		func.plug = self
-		self.funcs.append(func)
+			offsets.append(len(data))
+			for i in xrange(len(offsets) - 1):
+				# send the command (will throw an exception if it fails)
+				func[i].addr = self._exec_cmd(op, offsets[i + 1] - offsets[i], 0, buf + offsets[i], 0)
+				func[i].plug = self
+				self.funcs.append(func[i])
+		finally:
+			self.world.free(buf)
+
 
 	def compile(self, code, unhandled_return = None, function_type = 0):
 		# create a visitor and compile
@@ -102,8 +117,7 @@ class Plug(object):
 		visitor.visit(p)
 
 		# load all the functions
-		for func in visitor.functions:
-			self.load(func, unhandled_return, function_type)
+		self.load(visitor.functions, unhandled_return, function_type)
 
 		return filter(lambda i:not i.static, visitor.functions)
 
@@ -114,67 +128,150 @@ class Plug(object):
 		func.special_funcs = {}
 
 		if func.anonymous:
-			op = Plug.KPLUGS_UNLOAD_ANONYMOUS
+			op = PlugCore.KPLUGS_UNLOAD_ANONYMOUS
 			length = 0
 			ptr = func.addr
+			name_buf = 0
 		else:
-			op = Plug.KPLUGS_UNLOAD
+			op = PlugCore.KPLUGS_UNLOAD
 			length = len(func.name)
-			name_buf = ctypes.c_buffer(func.name)
-			ptr = ctypes.addressof(name_buf)
+			name_buf = self.world.alloc(len(func.name))
+			self.world.mem_write(name_buf, func.name)
+			ptr = name_buf
 
-		if self.glob:
-			op |= (1 << 7) # add the global flag
+		try:
+			# send the command (will throw an exception if it fails)
+			self._exec_cmd(op, length, 0, ptr, 0)
+			self.funcs.remove(func)
+		finally:
+			if name_buf:
+				self.world.free(name_buf)
 
-		# send the command (will throw an exception if it fails)
-		self._exec_cmd(op, length, 0, ptr, 0)
-		self.funcs.remove(func)
 
+	def send(self, func, data):
+		if func.anonymous:
+			op = PlugCore.KPLUGS_SEND_DATA_ANONYMOUS
+			length = 0
+			ptr = func.addr
+			name_buf = 0
+		else:
+			op = PlugCore.KPLUGS_SEND_DATA
+			length = len(func.name)
+			name_buf = self.world.alloc(len(func.name))
+			self.world.mem_write(name_buf, func.name)
+			ptr = name_buf
+
+		try:
+			addr = self.world.alloc(len(data))
+			try:
+				self.world.mem_write(addr, data)
+				return self._exec_cmd(op, length, len(data), ptr, addr)
+			finally:
+				self.world.free(addr)
+		finally:
+			if name_buf:
+				self.world.free(name_buf)
+
+	def recv(self, func, buf_length):
+		addr = 0
+		try:
+			if func.anonymous:
+				op = PlugCore.KPLUGS_RECV_DATA_ANONYMOUS
+				length = 0
+				ptr = func.addr
+				addr = self.world.alloc(buf_length)
+			else:
+				op = PlugCore.KPLUGS_RECV_DATA
+				length = len(func.name)
+				addr = self.world.alloc(buf_length + len(func.name))
+				ptr = addr + buf_length
+				self.world.mem_write(ptr, func.name)
+
+			real_length = self._exec_cmd(op, length, buf_length, ptr, addr)
+			return self.world.mem_read(addr, min(buf_length, real_length))
+		finally:
+			if addr:
+				self.world.free(addr)
 
 	def __call__(self, func, *args):
 		if not func in self.funcs:
 			raise Exception("This function doesn't belongs to this plug")
 
+		allocs = []
+		data = ""
+		ws = self.word_size
 		if func.anonymous:
-			op = Plug.KPLUGS_EXECUTE_ANONYMOUS
+			op = PlugCore.KPLUGS_EXECUTE_ANONYMOUS
 			length = 0
 			ptr = func.addr
+			name_buf = 0
 		else:
-			op = Plug.KPLUGS_EXECUTE
+			op = PlugCore.KPLUGS_EXECUTE
 			length = len(func.name)
-			name_buf = ctypes.c_buffer(func.name)
-			ptr = ctypes.addressof(name_buf)
+			allocs.append(len(data))
+			data += func.name
+			data += "\0" * (ws - (len(data) % ws))
+
 
 		new_args = []
-		bufs = []
-		for arg in args:
-			add = arg
-			if isinstance(arg, str):
-				bufs.append(ctypes.c_buffer(arg))
-				add = ctypes.addressof(bufs[-1])
-			new_args.append(add)
-		args_buf = ctypes.c_buffer(struct.pack("P" * len(new_args), *new_args))
+		addr = 0
+		try:
+			read_back = False
+			for arg in args:
+				if isinstance(arg, str):
+					allocs.append(len(data))
+					data += arg
+					data += "\0" * (ws - (len(data) % ws))
+				elif isinstance(arg, bytearray):
+					read_back = True
+					allocs.append(len(data))
+					data += str(arg)
+					data += b"\0" * (ws - (len(data) % ws))
 
-		# send the command (will throw an exception if it fails)
-		return self._exec_cmd(op, length, len(args) * WORD_SIZE, ptr, ctypes.addressof(args_buf))
+			addr = self.world.alloc(len(data) + len(args)*ws)
+			args_buf = addr + len(data)
+			if not func.anonymous:
+				ptr = addr
+				allocs = allocs[1:]
+
+			for i in xrange(len(args)):
+				if isinstance(args[i], str) or isinstance(args[i], bytearray):
+					arg = addr + allocs[i]
+				else:
+					arg = args[i]
+				new_args.append(arg)
+
+			local_buf = self.world.pack(self.world.form * len(new_args), *new_args)
+			self.world.mem_write(addr, data + local_buf)
+
+			# send the command (will throw an exception if it fails)
+			try:
+				return self._exec_cmd(op, length, len(args) * ws, ptr, args_buf)
+			finally:
+				if read_back:
+					data = self.world.mem_read(addr, len(data))
+					for i in range(len(args)):
+						if isinstance(args[i], bytearray):
+							args[i][:len(args[i])] = data[allocs[i]:allocs[i] + len(args[i])]
+		finally:
+			if addr:
+				self.world.free(addr)
 
 	# you MUST call this member if the plug is global or the functions will never be freed!
-	def close(self):
-		if self.glob:
+	def close(self, keep_globals=False):
+		if self.glob and keep_globals:
 			while len(self.funcs) != 0:
 				self.unload(self.funcs[0])
 
 		# we don't need to unload functions if it's not global because closing the file will do it for us
 		self.funcs = []
-		if self.fd >= 0:
-			os.close(self.fd)
-			self.fd = -1
+		self.world.close()
 
 
 
 
 RESERVED_PREFIX =	["KERNEL"]
-RESERVED_NAMES = 	["VARIABLE_ARGUMENT", "ANONYMOUS", "STATIC", "ADDRESSOF", "word", "buffer", "array", "pointer", "new", "delete"]
+RESERVED_NAMES = 	["VARIABLE_ARGUMENT", "ANONYMOUS", "STATIC", "ADDRESSOF", "word", "buffer", "array", "pointer", "new", "delete", "recv", "send"]
 RESERVED_FUNCTIONS = 	["_"]
 
 # validate name
@@ -209,10 +306,11 @@ class Function(object):
 	FLOW_TRY = 3
 	FLOW_WHILE = 4
 	FLOW_DYN_FREE = 5
+	FLOW_SEND_DATA = 6
 
-	FLOW_BLOCKEND = 6
-	FLOW_THROW = 7
-	FLOW_RET = 8
+	FLOW_BLOCKEND = 7
+	FLOW_THROW = 8
+	FLOW_RET = 9
 
 	# Expressions:
 	EXP_WORD = 0
@@ -226,25 +324,29 @@ class Function(object):
 	EXP_BUF_OFFSET = 6
 	EXP_ADD = 7
 	EXP_SUB = 8
-	EXP_MUL = 9
-	EXP_DIV = 10
-	EXP_AND = 11
-	EXP_XOR = 12
-	EXP_OR = 13
-	EXP_BOOL_AND = 14
-	EXP_BOOL_OR = 15
-	EXP_NOT = 16
-	EXP_BOOL_NOT = 17
-	EXP_MOD = 18
-	EXP_CALL_STRING = 19
-	EXP_CALL_PTR = 20
-	EXP_CALL_END = 21
-	EXP_CMP_EQ = 22
-	EXP_CMP_UNSIGN = 23
-	EXP_CMP_SIGN = 24
-	EXP_DYN_ALLOC = 25
-	EXP_ARGS = 26
-	EXP_EXP = 27
+	EXP_MUL_UNSIGN = 9
+	EXP_MUL_SIGN = 10
+	EXP_DIV_UNSIGN = 11
+	EXP_DIV_SIGN = 12
+	EXP_AND = 13
+	EXP_XOR = 14
+	EXP_OR = 15
+	EXP_BOOL_AND = 16
+	EXP_BOOL_OR = 17
+	EXP_NOT = 18
+	EXP_BOOL_NOT = 19
+	EXP_MOD = 20
+	EXP_CALL_STRING = 21
+	EXP_CALL_PTR = 22
+	EXP_CALL_END = 23
+	EXP_CMP_EQ = 24
+	EXP_CMP_UNSIGN = 25
+	EXP_CMP_SIGN = 26
+	EXP_EXT_SIGN = 27
+	EXP_DYN_ALLOC = 28
+	EXP_RECV_DATA = 29
+	EXP_ARGS = 30
+	EXP_EXP = 31
 
 	FUNC_VARIABLE_ARGUMENT = 1
 	FUNC_EXTERNAL = 2
@@ -254,9 +356,10 @@ class Function(object):
 	BINOP =		{
 				Add : EXP_ADD,
 				Sub : EXP_SUB,
-				Mult : EXP_MUL,
-				Div : EXP_DIV,
+				Mult : EXP_MUL_SIGN,
+				Div : EXP_DIV_SIGN,
 				BitAnd : EXP_AND,
+				BitXor : EXP_XOR,
 				BitOr : EXP_OR,
 				Mod : EXP_MOD,
 			}
@@ -281,9 +384,10 @@ class Function(object):
 			}
 
 
-	def __init__(self, name):
+	def __init__(self, name, word_size = WORD_SIZE):
 		validate_name(name)
 		self.name = name
+		self.word_size = word_size
 		self.new_var = 1
 		self.all_vars = {}
 		self.vars = [] # the order is importand here
@@ -299,7 +403,7 @@ class Function(object):
 				return_exception_value = 0,
 				error_return = 0,
 				function_type = 0):
-		return {	"op" : Function.OP_FUNCTION, 
+		return {	"op" : Function.OP_FUNCTION,
 				"min_args" : self.min_args,
 				"return_exception_value" : return_exception_value,
 				"name" : name,
@@ -307,10 +411,12 @@ class Function(object):
 				"function_type" : function_type }
 
 	# get a variable type opcode
-	def _get_var(self, typ, is_arg = 0, size = WORD_SIZE, init = 0, flags = 0):
+	def _get_var(self, typ, is_arg = 0, size = None, init = 0, flags = 0):
+		if size is None:
+			size = self.word_size
 		if typ == Function.VAR_UNDEF:
 			typ = Function.VAR_WORD
-		return {	"op" : Function.OP_VARIABLE, 
+		return {	"op" : Function.OP_VARIABLE,
 				"type" : typ,
 				"is_arg" : is_arg,
 				"size" : size,
@@ -319,7 +425,7 @@ class Function(object):
 
 	# get a flow type opcode
 	def _get_flow(self, typ, val1 = 0, val2 = 0, val3 = 0):
-		return {	"op" : Function.OP_FLOW, 
+		return {	"op" : Function.OP_FLOW,
 				"type" : typ,
 				"val1" : val1,
 				"val2" : val2,
@@ -334,13 +440,15 @@ class Function(object):
 			val1 = val1["id"]
 			if not force:
 				return val1
-		return {	"op" : Function.OP_EXPRESSION, 
+		return {	"op" : Function.OP_EXPRESSION,
 				"type" : typ,
 				"val1" : val1,
 				"val2" : val2 }
 
 	# get the id of a variable
-	def _get_var_id(self, var_name, size = WORD_SIZE, create = False, typ = VAR_WORD, init = 0, flags = 0):
+	def _get_var_id(self, var_name, size = None, create = False, typ = VAR_WORD, init = 0, flags = 0):
+		if size is None:
+			size = self.word_size
 		if var_name not in self.all_vars:
 			if not create:
 				# the variable dosen't exists!
@@ -389,27 +497,27 @@ class Function(object):
 			raise Exception("order_blocks unexpected behavior")
 
 	# translate the arranged blocks to bytes
-	def _translate(self):
+	def _translate(self, world):
 		ret = ""
 		for block in self.all_blocks:
 			if block["op"] == Function.OP_FUNCTION:
-				ret += struct.pack("PPPP",	block["op"] | (block["min_args"] << 2) | (block["return_exception_value"] << 7),
+				ret += world.pack(world.form*4,	block["op"] | (block["min_args"] << 2) | (block["return_exception_value"] << 7),
 								block["name"],
 								block["error_return"],
 								block["function_type"])
 			elif block["op"] == Function.OP_VARIABLE:
-				ret += struct.pack("PPPP",	block["op"] | (block["type"] << 2) | (block["is_arg"] << 7),
+				ret += world.pack(world.form*4,	block["op"] | (block["type"] << 2) | (block["is_arg"] << 7),
 								block["size"],
 								block["init"],
 								block["flags"])
 			elif block["op"] == Function.OP_FLOW:
-				ret += struct.pack("PPPP",	block["op"] | (block["type"] << 2),
+				ret += world.pack(world.form*4,	block["op"] | (block["type"] << 2),
 								block["val1"],
 								block["val2"],
 								block["val3"])
 
 			elif block["op"] == Function.OP_EXPRESSION:
-				ret += struct.pack("PPPP",	block["op"] | (block["type"] << 2),
+				ret += world.pack(world.form*4,	block["op"] | (block["type"] << 2),
 								block["val1"],
 								block["val2"],
 								0)
@@ -435,7 +543,7 @@ class Function(object):
 
 
 	# generate bytes from a compiled function
-	def to_bytes(self, unhandled_return = None, function_type = 0):
+	def to_bytes(self, unhandled_return, function_type, world):
 		# if unahdnled_return stays None the default return value (if an exception occured) will be the exception value
 
 		if unhandled_return == None:
@@ -471,7 +579,7 @@ class Function(object):
 		# arrange the blocks in the right order
 		self.end = len(self.all_blocks)
 		self._order_blocks(self.final)
-		
+
 		# flatten everything
 		all_blocks = []
 		for block in self.all_blocks:
@@ -479,10 +587,16 @@ class Function(object):
 		self.all_blocks = all_blocks
 
 		# return the bytes
-		return self._translate() + self._generate_string_table()
+		return self._translate(world) + self._generate_string_table()
 
 	def unload(self):
 		self.plug.unload(self)
+
+	def send(self, data):
+		return self.plug.send(self, data)
+
+	def recv(self, length):
+		return self.plug.recv(self, length)
 
 	def __call__(self, *args):
 		return self.plug(self, *args)
@@ -494,6 +608,7 @@ class compiler_visitor(ast.NodeVisitor):
 
 	def __init__(self, plug):
 		ast.NodeVisitor.__init__(self)
+		self.word_size = plug.word_size
 		self.in_function = False
 		self.functions = []
 		self.func = None
@@ -548,9 +663,9 @@ class compiler_visitor(ast.NodeVisitor):
 				raise Exception("Invalid assign")
 
 		if node.func.id == "array":
-			mult = WORD_SIZE
+			mult = self.word_size
 		if node.func.id == "word" or node.func.id == "pointer":
-			size = WORD_SIZE
+			size = self.word_size
 			init = 0
 			if len(node.args) > 1:
 				raise Exception("Invalid assign")
@@ -672,7 +787,7 @@ def fstring_function(%s):
 			# you can't create a function inside a function
 			raise Exception("Defining a function inside a function")
 
-		self.func = Function(node.name)
+		self.func = Function(node.name, self.word_size)
 		self.functions.append(self.func)
 		self.in_function = True
 
@@ -698,7 +813,7 @@ def fstring_function(%s):
 			if args[arg].id in self.func.all_vars.keys():
 				raise Exception("Two arguments with the same name!")
 
-			size = WORD_SIZE
+			size = self.word_size
 			init = 0
 			flags = 0
 			if defaults[arg]:
@@ -937,6 +1052,9 @@ def fstring_function(%s):
 			return self.func._get_exp(Function.EXP_BOOL_NOT, invers)
 		if type(node.ops[0]) == Gt:
 			return self.func._get_exp(Function.EXP_CMP_SIGN, comparators, left)
+		if type(node.ops[0]) == GtE:
+			invers = self.func._get_exp(Function.EXP_CMP_SIGN, left, comparators)
+			return self.func._get_exp(Function.EXP_BOOL_NOT, invers)
 		if type(node.ops[0]) == Eq:
 			return self.func._get_exp(Function.EXP_CMP_EQ, left, comparators)
 		if type(node.ops[0]) == NotEq:
@@ -990,7 +1108,7 @@ def fstring_function(%s):
 			ret += new_args
 			ret.append(self.func._get_exp(Function.EXP_CALL_END))
 			return ret
-			
+
 
 		left = self.visit(node.left)
 		right = self.visit(node.right)
@@ -1015,7 +1133,7 @@ def fstring_function(%s):
 		last_value = self.visit(node.values[0])
 		for value in node.values[1:]:
 			new_value = self.visit(value)
-			last_value = self.func._get_exp(Function.BOOLOP[type(node.op)], new_value, last_value)
+			last_value = self.func._get_exp(Function.BOOLOP[type(node.op)], last_value, new_value)
 
 		return last_value
 
@@ -1026,10 +1144,22 @@ def fstring_function(%s):
 		if node.starargs:
 			raise Exception("Functions must be simple")
 
+		parse_args = node.args
 		if type(node.func) != Name or self.func.all_vars.has_key(node.func.id):
 			reverse = True
-			flags = Function.FUNC_EXTERNAL # note: the language do not support calling variable argument functions as expressions
+			flags = Function.FUNC_EXTERNAL
 			val = self.visit(node.func)
+			ret = [self.func._get_exp(Function.EXP_CALL_PTR, val, flags)]
+
+		elif node.func.id == "VARIABLE_ARGUMENT":
+			if len(parse_args) == 0:
+				raise Exception("VARIABLE function must have an argument")
+
+			reverse = True
+			flags = Function.FUNC_EXTERNAL | Function.FUNC_VARIABLE_ARGUMENT
+
+			val = self.visit(parse_args[0])
+			parse_args = parse_args[1:]
 			ret = [self.func._get_exp(Function.EXP_CALL_PTR, val, flags)]
 		else:
 			name = node.func.id
@@ -1043,7 +1173,7 @@ def fstring_function(%s):
 				if type(node.args[0]) != Name:
 					if name != "DEREF":
 						raise Exception("Error using macro %s" % (name, ))
-					return self.func._get_exp(Function.EXP_DEREF, self.visit(node.args[0]), WORD_SIZE)
+					return self.func._get_exp(Function.EXP_DEREF, self.visit(node.args[0]), self.word_size)
 
 				try:
 					var = self.func._get_var_id(node.args[0].id)
@@ -1054,7 +1184,7 @@ def fstring_function(%s):
 					if var["type"] != Function.VAR_POINTER:
 						raise Exception("Can dereference only pointers")
 					op = Function.EXP_DEREF
-					val2 = WORD_SIZE
+					val2 = self.word_size
 				else:
 					op = Function.EXP_ADDRESSOF
 					val2 = 0
@@ -1077,6 +1207,43 @@ def fstring_function(%s):
 					self._create_flow(Function.FLOW_DYN_FREE, self.visit(node.args[0]))
 					return self.func._get_exp(Function.EXP_WORD, 0) # return 0
 
+			elif type(node.func) == Name and node.func.id in ["send", "recv"]:
+				if node.func.id == "send":
+					if len(node.args) > 2:
+						raise Exception("Bad syntax of send")
+					if type(node.args[0]) != Name:
+						raise Exception("send's argument must be a variable")
+					try:
+						var = self.func._get_var_id(node.args[0].id)
+					except:
+						raise Exception("Cannot find variable: '%s'" % (node.args[0].id, ))
+					if var["type"] == Function.VAR_WORD:
+						raise Exception("Wrong variable type")
+
+					arg2 = 0
+					if len(node.args) > 1:
+						if type(node.args[1]) != Str:
+							raise Exception("Second parameter must be a string")
+						arg2 = self.func._get_string_value(node.args[1].s)
+					self._create_flow(Function.FLOW_SEND_DATA, var["id"], arg2)
+					return self.func._get_exp(Function.EXP_WORD, 0) # return 0
+				else:
+					is_global = 0
+					if len(node.args) == 2:
+						if type(node.args[1]) != Num or (node.args[1].n != 0 and node.args[1].n != 1):
+							raise Exception("Bad syntax of new")
+						is_global = node.args[1].n
+					elif len(node.args) != 1:
+						raise Exception("Bad syntax of recv")
+					try:
+						var = self.func._get_var_id(node.args[0].id)
+						if var["type"] != Function.VAR_POINTER:
+							raise
+					except:
+						raise Exception("Can receive only pointers")
+
+					return self.func._get_exp(Function.EXP_RECV_DATA, var["id"], is_global)
+
 			if name.startswith("KERNEL_"):
 				# this is the macro for using external functions
 				reverse = True
@@ -1088,7 +1255,7 @@ def fstring_function(%s):
 
 		# parse the arguments
 		args = []
-		for arg in node.args:
+		for arg in parse_args:
 			if type(arg) == Name:
 				if self.consts.has_key(arg.id):
 					val = self.func._get_exp(Function.EXP_WORD, self.consts[arg.id])
@@ -1110,17 +1277,17 @@ def fstring_function(%s):
 
 	def visit_Str(self, node):
 		return self.func._get_exp(Function.EXP_STRING, self.func._get_string_value(node.s))
-		
+
 
 	def visit_Num(self, node):
-		if not self.in_function:	
+		if not self.in_function:
 			raise Exception("All expressions must be in a function")
 
 		return self.func._get_exp(Function.EXP_WORD, node.n)
 
 	def visit_Delete(self, node):
 		for target in node.targets:
-			self._create_flow(Function.FLOW_DYN_FREE, self.visit(target))				
+			self._create_flow(Function.FLOW_DYN_FREE, self.visit(target))
 
 	def visit_Print(self, node):
 
@@ -1128,15 +1295,20 @@ def fstring_function(%s):
 			args = [self.func._get_exp(Function.EXP_CALL_STRING, self.func._get_string_value("printk"), Function.FUNC_EXTERNAL | Function.FUNC_VARIABLE_ARGUMENT)]
 			if extra: # reversed order (because it's an external function)
 				if type(extra) == list:
-					extra = self.func._get_exp(Function.EXP_EXP, extra)
-				args.append(extra)
+					for i in extra[::-1]:
+						args.append(self.func._get_exp(Function.EXP_EXP, i))
+				else:
+					args.append(extra)
 			args.append(self.func._get_exp(Function.EXP_STRING, self.func._get_string_value(formt)))
 			args.append(self.func._get_exp(Function.EXP_CALL_END))
 			self._create_flow(Function.FLOW_ASSIGN, self.func._get_var_id("_", create = True)["id"], args)
 
+		all_formt = ""
+		extras = []
+		vars = []
 		for n in xrange(len(node.values)):
 			if n:
-				_create_printk(" ")
+				all_formt += " "
 			formt = "%d"
 			var = None
 			if type(node.values[n]) == Str or (type(node.values[n]) == BinOp and type(node.values[n].op) == Mod and type(node.values[n].left) == Str):
@@ -1147,18 +1319,20 @@ def fstring_function(%s):
 					extra = self.func._get_exp(Function.EXP_VAR, var, force = True)
 				else:
 					extra = self.visit(node.values[n])
-				
 			else:
 				if type(node.values[n]) == Name:
 					extra = self.func._get_exp(Function.EXP_VAR, node.values[n].id, force = True)
 				else:
 					extra = self.visit(node.values[n])
-			_create_printk(formt, extra)
+			all_formt += formt
+			extras.append(extra)
 			if var:
-				self._create_flow(Function.FLOW_DYN_FREE, self.func._get_var_id(var)["id"])
+				vars.append(var)
 
-		if node.nl:
-			_create_printk("\n")
+		all_formt += "\n"
+		_create_printk(all_formt, extras)
+		for var in vars:
+			self._create_flow(Function.FLOW_DYN_FREE, self.func._get_var_id(var)["id"])
 
 	def visit_Raise(self, node):
 		if not self.in_function:

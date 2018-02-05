@@ -3,6 +3,7 @@
 #include "env.h"
 #include "vm.h"
 #include "types.h"
+#include "queue.h"
 
 /* create a new context */
 int context_create(context_t **cont)
@@ -17,32 +18,35 @@ int context_create(context_t **cont)
 	(*cont)->funcs.prev = NULL;
 	(*cont)->anonym.next = NULL;
 	(*cont)->anonym.prev = NULL;
-	(*cont)->has_answer = 0;
-	(*cont)->last_exception.had_exception = 0;
 	spin_lock_init(&(*cont)->lock);
 
 	return 0;
 }
 
 /* lock a context */
-void context_lock(context_t *cont)
+unsigned long context_lock(context_t *cont)
 {
-	spin_lock(&cont->lock);
+	unsigned long flags;
+
+	spin_lock_irqsave(&cont->lock, flags);
+
+	return flags;
 }
 
 /* unlock a context */
-void context_unlock(context_t *cont)
+void context_unlock(context_t *cont, unsigned long flags)
 {
-	spin_unlock(&cont->lock);
+	spin_unlock_irqrestore(&cont->lock, flags);
 }
 
 /* add a function to a context */
 int context_add_function(context_t *cont, function_t *func)
 {
 	function_t *check_func = NULL;
+	unsigned long flags;
 	int err = 0;
 
-	context_lock(cont);
+	flags = context_lock(cont);
 
 	if (func->name != NULL) {
 		/* this is a function with a name */
@@ -81,7 +85,7 @@ int context_add_function(context_t *cont, function_t *func)
 	func->cont = cont;
 
 clean:
-	context_unlock(cont);
+	context_unlock(cont, flags);
 	return err;
 }
 
@@ -89,8 +93,9 @@ clean:
 void context_free_function(function_t *func)
 {
 	context_t *cont = func->cont;
+	unsigned long flags;
 
-	context_lock(cont);
+	flags = context_lock(cont);
 
 	if (NULL == func->list.prev && NULL == func->list.next) {
 		/* This is a race condition! The function was already removed from the context... */
@@ -105,10 +110,13 @@ void context_free_function(function_t *func)
 	func->list.prev = NULL;
 	func->list.next = NULL;
 
+	queue_kill(&func->to_user);
+	queue_kill(&func->to_kernel);
+
 	function_put(func);
 
 clean:
-	context_unlock(cont);
+	context_unlock(cont, flags);
 }
 
 /* delete a context */
@@ -130,8 +138,9 @@ void context_free(context_t *cont)
 void *context_find_function(context_t *cont, byte *name)
 {
 	function_t *func;
-	
-	context_lock(cont);
+	unsigned long flags;
+
+	flags = context_lock(cont);
 
 	func = LIST_TO_STRUCT(function_t, list, cont->funcs.next);
 	while (func != NULL) {
@@ -143,16 +152,17 @@ void *context_find_function(context_t *cont, byte *name)
 	}
 
 clean:
-	context_unlock(cont);
+	context_unlock(cont, flags);
 	return func;
 }
 
 /* find an anonymous function by address */
 void *context_find_anonymous(context_t *cont, byte *ptr)
 {
+	unsigned long flags;
 	function_t *func;
 
-	context_lock(cont);
+	flags = context_lock(cont);
 
 	func = LIST_TO_STRUCT(function_t, list, cont->anonym.next);
 	while (func != NULL) {
@@ -164,64 +174,7 @@ void *context_find_anonymous(context_t *cont, byte *ptr)
 	}
 
 clean:
-	context_unlock(cont);
+	context_unlock(cont, flags);
 	return func;
 }
 
-/* copy the reply back to the user */
-int context_get_reply(context_t *cont, char *buf, word length)
-{
-	word copy;
-
-	context_lock(cont);
-
-	/* return an answer if there is one */
-	if (cont->has_answer) {
-		copy = (length > sizeof(kplugs_command_t)) ? sizeof(kplugs_command_t) : length;
-		memory_copy(buf, &cont->cmd, copy);
-		cont->has_answer = 0;
-	} else {
-		copy = 0;
-	}
-
-	context_unlock(cont);
-
-	return (int)copy;
-}
-
-/* copy the last exception to inside or outside memory */
-int context_get_last_exception(context_t *cont, exception_t *excep)
-{
-	int err;
-
-	context_lock(cont);
-
-	if (!cont->last_exception.had_exception) {
-		ERROR_CLEAN(-ERROR_PARAM);
-	}
-
-	err = safe_memory_copy(excep, &cont->last_exception, sizeof(exception_t), ADDR_UNDEF, ADDR_INSIDE, 0, 0);
-
-	cont->last_exception.had_exception = 0;
-
-clean:
-	context_unlock(cont);
-	return err;
-}
-
-/* create a reply */
-void context_create_reply(context_t *cont, word val, exception_t *excep)
-{
-	context_lock(cont);
-
-	if (NULL != excep) {
-		memory_copy(&cont->last_exception, excep, sizeof(exception_t));
-	}
-
-	memory_set(&cont->cmd, 0, sizeof(kplugs_command_t));
-	cont->cmd.val1 = val;
-	cont->cmd.type = KPLUGS_REPLY;
-	cont->has_answer = 1;
-
-	context_unlock(cont);
-}

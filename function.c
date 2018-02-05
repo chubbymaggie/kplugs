@@ -4,6 +4,7 @@
 #include "env.h"
 #include "stack.h"
 #include "calling.h"
+#include "queue.h"
 
 #ifdef DEBUG
 
@@ -26,6 +27,8 @@ static const char *expression_names[] = {
 		"+",
 		"-",
 		"*",
+		"*",
+		"/",
 		"/",
 		"&",
 		"^",
@@ -305,14 +308,17 @@ static int function_check_expression(	bytecode_t *code,
 
 			return found;
 
+		case EXP_MUL_UNSIGN:
+		case EXP_DIV_UNSIGN:
 		case EXP_CMP_UNSIGN:
 			/* we want to print extra data */
 			DEBUG_PRINT("unsigned");
 		case EXP_ADD:
 		case EXP_SUB:
-		case EXP_MUL:
-		case EXP_DIV:
+		case EXP_MUL_SIGN:
+		case EXP_DIV_SIGN:
 		case EXP_AND:
+		case EXP_XOR:
 		case EXP_OR:
 		case EXP_BOOL_AND:
 		case EXP_BOOL_OR:
@@ -331,6 +337,19 @@ static int function_check_expression(	bytecode_t *code,
 
 			return found;
 
+		case EXP_EXT_SIGN:
+			if (val2) {
+				ERROR(-ERROR_PARAM);
+			}
+
+			DEBUG_PRINT("EXT(");
+
+			CHECK_EXPRESSION(val1);
+
+			DEBUG_PRINT(")");
+
+			return found;
+
 		case EXP_DYN_ALLOC:
 			if (val2 > 1) { /* should be 0 if local or 1 if global */
 				ERROR(-ERROR_PARAM);
@@ -341,6 +360,19 @@ static int function_check_expression(	bytecode_t *code,
 			CHECK_EXPRESSION(val1);
 
 			DEBUG_PRINT(", %ld)", val2);
+
+			return found;
+
+		case EXP_RECV_DATA:
+			if (val1 >= numvars) {
+				ERROR(-ERROR_VAR);
+			}
+
+			if (code[val1].var.type != VAR_POINTER || val2 > 1) {
+				ERROR(-ERROR_PARAM);
+			}
+
+			DEBUG_PRINT("recv(%s%lu)", variable_names[code[val1].var.type], val1);
 
 			return found;
 
@@ -513,7 +545,7 @@ static int function_check_flow(	bytecode_t *code,
 
 
 			case FLOW_DYN_FREE:
-				if (val2) {
+				if (val2 || val3) {
 					ERROR(-ERROR_PARAM);
 				}
 
@@ -521,6 +553,21 @@ static int function_check_flow(	bytecode_t *code,
 
 				CHECK_EXPRESSION(val1);
 
+				DEBUG_PRINT(")\n");
+
+				break;
+
+			case FLOW_SEND_DATA:
+				if (val1 >= numvars) {
+					ERROR(-ERROR_VAR);
+				}
+
+				DEBUG_PRINT("send(%s%lu", variable_names[code[val1].var.type], val1);
+
+				if (val2) {
+					DEBUG_PRINT(", [const%lu]", val2);
+					*max_string = MAX(*max_string, val2);
+				}
 				DEBUG_PRINT(")\n");
 
 				break;
@@ -861,6 +908,9 @@ int function_create(bytecode_t *code, word len, function_t **func)
 	memory_set(*func, 0, sizeof(function_t));
 	atomic_set(&(*func)->ref_count, 1);
 
+	init_queue(&(*func)->to_user, &dyn_free_callback);
+	init_queue(&(*func)->to_kernel, &dyn_free_callback);
+
 	err = function_check(code, len, *func);
 	if (err < 0) {
 		goto clean;
@@ -875,7 +925,6 @@ int function_create(bytecode_t *code, word len, function_t **func)
 		*(word *)GET_FUNCTION_CALLBACK(*func) = (word)standard_function_callback;
 	}
 	err = 0;
-
 
 	if (code[0].func.name) {
 		(*func)->name = (char *)((*func)->raw) + (*func)->string_table[code[0].func.name - 1];
